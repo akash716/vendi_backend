@@ -1,0 +1,6 @@
+node_modules/
+.env
+uploads/candies/*.jpg
+uploads/candies/*.png
+uploads/candies/*.webp
+*.log
