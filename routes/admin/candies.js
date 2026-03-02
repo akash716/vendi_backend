@@ -1,19 +1,14 @@
 import express from "express";
-import multer from "multer";
-import path from "path";
-import { db } from "../../config/db.js";
+import multer  from "multer";
+import { db }  from "../../config/db.js";
 
-const router = express.Router();
+const router  = express.Router();
 
-/* ── MULTER ── */
-const storage = multer.diskStorage({
-  destination: "uploads/candies",
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, Date.now() + ext);
-  }
+// multer — memory storage (no disk, base64 mein convert karenge)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 5 * 1024 * 1024 }, // 5MB max
 });
-const upload = multer({ storage });
 
 /* ── GET ALL CANDIES ── */
 router.get("/", async (_req, res) => {
@@ -48,24 +43,17 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "Name, category & price required" });
     }
 
-    // get category prefix from DB
     const [[cat]] = await db.query(
       "SELECT prefix FROM candy_categories WHERE name = ?",
       [category.trim()]
     );
+    if (!cat) return res.status(400).json({ error: "Invalid category" });
 
-    if (!cat) {
-      return res.status(400).json({ error: "Invalid category" });
-    }
-
-    const prefix = cat.prefix;
-
-    // auto-generate code: PREFIX + next number
     const [[row]] = await db.query(
       "SELECT COUNT(*) AS c FROM candies WHERE code LIKE ?",
-      [`${prefix}%`]
+      [`${cat.prefix}%`]
     );
-    const code = `${prefix}${row.c + 1}`;
+    const code = `${cat.prefix}${row.c + 1}`;
 
     const [result] = await db.query(
       "INSERT INTO candies (code, name, price, category) VALUES (?, ?, ?, ?)",
@@ -81,11 +69,9 @@ router.post("/", async (req, res) => {
 /* ── UPDATE CANDY ── */
 router.put("/:id", async (req, res) => {
   const { name, category, price } = req.body;
-
   if (!name || !price || !category) {
     return res.status(400).json({ error: "Invalid payload" });
   }
-
   try {
     await db.query(
       "UPDATE candies SET name=?, price=?, category=? WHERE id=?",
@@ -97,24 +83,27 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-/* ── IMAGE UPLOAD ── */
+/* ── IMAGE UPLOAD — base64 in DB (no file system needed) ── */
 router.post("/:id/image", upload.single("image"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "Image required" });
-  }
-  const imagePath = `/uploads/candies/${req.file.filename}`;
-  await db.query("UPDATE candies SET image=? WHERE id=?", [imagePath, req.params.id]);
-  res.json({ success: true, image: imagePath });
-});
+  if (!req.file) return res.status(400).json({ error: "Image required" });
 
-export default router;
+  try {
+    const mime   = req.file.mimetype;                          // e.g. image/webp
+    const b64    = req.file.buffer.toString("base64");
+    const dataUrl = `data:${mime};base64,${b64}`;
+
+    await db.query("UPDATE candies SET image=? WHERE id=?", [dataUrl, req.params.id]);
+    res.json({ success: true, image: dataUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ── DELETE CANDY ── */
 router.delete("/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    // Check if candy is in any candy list
     const [[inList]] = await db.query(
       "SELECT id FROM candy_list_items WHERE candy_id = ? LIMIT 1", [id]
     );
@@ -124,14 +113,14 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
-    // Delete dependent rows then candy
     await db.query("DELETE FROM stall_candy_inventory WHERE candy_id=?", [id]);
     await db.query("DELETE FROM combo_offer_rule_candies WHERE candy_id=?", [id]);
     await db.query("DELETE FROM candies WHERE id=?", [id]);
 
     res.json({ success: true });
   } catch (err) {
-    console.error("DELETE CANDY:", err);
     res.status(500).json({ error: err.message });
   }
 });
+
+export default router;
