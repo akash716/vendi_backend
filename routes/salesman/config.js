@@ -5,13 +5,11 @@ const router = express.Router();
 
 /**
  * GET /api/salesman/config/:stallId
- * Loads stall, assigned candy-list and offer-list, candies (from list) and offers (from offer list)
- * NOTE: image is fetched separately to avoid MySQL tmp table overflow with large base64 data
+ * NO images in this response — images fetched one by one via /api/salesman/image/:candyId
  */
 router.get("/:stallId", async (req, res) => {
   const { stallId } = req.params;
   try {
-    /* 1️⃣ STALL */
     const [[stall]] = await db.query(
       `SELECT * FROM stalls WHERE id = ? AND is_active = 1 AND is_deleted = 0`,
       [stallId]
@@ -24,14 +22,10 @@ router.get("/:stallId", async (req, res) => {
       return res.status(400).json({ error: "Candy list not assigned to stall" });
     }
 
-    /* 2️⃣ LOAD CANDIES — WITHOUT image column to avoid tmp table full error */
+    // NO image column here — avoids tmp table overflow
     const [candies] = await db.query(
-      `
-      SELECT
-        c.id,
-        c.code,
-        c.name,
-        cli.price,
+      `SELECT
+        c.id, c.code, c.name, cli.price,
         IFNULL(i.stock, 0) AS stock,
         COALESCE(
           NULLIF(c.category, ''),
@@ -42,45 +36,24 @@ router.get("/:stallId", async (req, res) => {
             ELSE NULL
           END
         ) AS category
-      FROM candy_list_items cli
-      JOIN candies c ON c.id = cli.candy_id
-      LEFT JOIN stall_candy_inventory i
-        ON i.stall_id = ?
-       AND i.candy_id = cli.candy_id
-      WHERE cli.list_id = ?
-      ORDER BY cli.price, c.code
-      `,
+       FROM candy_list_items cli
+       JOIN candies c ON c.id = cli.candy_id
+       LEFT JOIN stall_candy_inventory i
+         ON i.stall_id = ? AND i.candy_id = cli.candy_id
+       WHERE cli.list_id = ?
+       ORDER BY cli.price, c.code`,
       [stallId, candyListId]
     );
 
-    /* 2b️⃣ FETCH IMAGES SEPARATELY (no JOIN/ORDER BY = no tmp table) */
-    const candyIds = candies.map(c => c.id);
-    let imageMap = {};
-    if (candyIds.length > 0) {
-      const [imgRows] = await db.query(
-        "SELECT id, image FROM candies WHERE id IN (?)",
-        [candyIds]
-      );
-      imgRows.forEach(r => { imageMap[r.id] = r.image; });
-    }
-    const candiesWithImages = candies.map(c => ({
-      ...c,
-      image: imageMap[c.id] || null,
-    }));
+    const uniquePrices = [...new Set(candies.map(c => Number(c.price)))].sort((a, b) => a - b);
 
-    const uniquePrices = [...new Set(candiesWithImages.map(c => Number(c.price)))].sort((a, b) => a - b);
-
-    /* 3️⃣ LOAD OFFERS */
     let offers = [];
     if (offerListId) {
       const [rows] = await db.query(
-        `
-        SELECT id, unique_count, offer_price, price, price_pattern
-        FROM combo_offer_rules
-        WHERE offer_list_id = ?
-          AND is_active = 1
-        ORDER BY unique_count DESC
-        `,
+        `SELECT id, unique_count, offer_price, price, price_pattern
+         FROM combo_offer_rules
+         WHERE offer_list_id = ? AND is_active = 1
+         ORDER BY unique_count DESC`,
         [offerListId]
       );
       offers = rows.map(r => {
@@ -92,38 +65,51 @@ router.get("/:stallId", async (req, res) => {
       });
     }
 
-    /* 4️⃣ ATTACH CANDIES TO OFFERS */
     for (const offer of offers) {
       if (offer.price !== null) {
         const basePrice = Number(offer.price);
         let targetPrice = uniquePrices.find(p => p === basePrice);
         if (!targetPrice && uniquePrices.length) {
-          targetPrice = uniquePrices.reduce((closest, current) =>
-            Math.abs(current - basePrice) < Math.abs(closest - basePrice) ? current : closest
-          , uniquePrices[0]);
+          targetPrice = uniquePrices.reduce((a, b) =>
+            Math.abs(b - basePrice) < Math.abs(a - basePrice) ? b : a);
         }
-        offer.candies = candiesWithImages.filter(c => Number(c.price) === targetPrice);
+        offer.candies = candies.filter(c => Number(c.price) === targetPrice);
       } else if (offer.price_pattern?.length) {
         const mappedPrices = offer.price_pattern.map(p => {
-          const basePrice = Number(p.price);
-          let match = uniquePrices.find(u => u === basePrice);
+          const bp = Number(p.price);
+          let match = uniquePrices.find(u => u === bp);
           if (!match && uniquePrices.length) {
-            match = uniquePrices.reduce((closest, current) =>
-              Math.abs(current - basePrice) < Math.abs(closest - basePrice) ? current : closest
-            , uniquePrices[0]);
+            match = uniquePrices.reduce((a, b) =>
+              Math.abs(b - bp) < Math.abs(a - bp) ? b : a);
           }
           return match;
         });
-        offer.candies = candiesWithImages.filter(c => mappedPrices.includes(Number(c.price)));
+        offer.candies = candies.filter(c => mappedPrices.includes(Number(c.price)));
       } else {
         offer.candies = [];
       }
     }
 
-    res.json({ stall, candies: candiesWithImages, offers });
+    res.json({ stall, candies, offers });
   } catch (err) {
     console.error("SALESMAN CONFIG ERROR:", err);
     res.status(500).json({ error: "Failed to load salesman config" });
+  }
+});
+
+/**
+ * GET /api/salesman/config/image/:candyId
+ * Returns only the image for one candy — called lazily by frontend
+ */
+router.get("/image/:candyId", async (req, res) => {
+  try {
+    const [[row]] = await db.query(
+      "SELECT image FROM candies WHERE id = ?",
+      [req.params.candyId]
+    );
+    res.json({ image: row?.image || null });
+  } catch (err) {
+    res.status(500).json({ image: null });
   }
 });
 
