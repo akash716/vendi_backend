@@ -1,33 +1,30 @@
 // routes/salesman/config.js
 import express from "express";
 import { db } from "../../config/db.js";
-
 const router = express.Router();
 
 /**
  * GET /api/salesman/config/:stallId
  * Loads stall, assigned candy-list and offer-list, candies (from list) and offers (from offer list)
+ * NOTE: image is fetched separately to avoid MySQL tmp table overflow with large base64 data
  */
 router.get("/:stallId", async (req, res) => {
   const { stallId } = req.params;
-
   try {
-    /* 1️⃣ STALL (directly read assigned lists) */
+    /* 1️⃣ STALL */
     const [[stall]] = await db.query(
       `SELECT * FROM stalls WHERE id = ? AND is_active = 1 AND is_deleted = 0`,
       [stallId]
     );
-
     if (!stall) return res.status(404).json({ error: "Stall not found" });
 
     const candyListId = stall.candy_list_id;
     const offerListId = stall.offer_list_id;
-
     if (!candyListId) {
       return res.status(400).json({ error: "Candy list not assigned to stall" });
     }
 
-    /* 2️⃣ LOAD CANDIES (list-based) */
+    /* 2️⃣ LOAD CANDIES — WITHOUT image column to avoid tmp table full error */
     const [candies] = await db.query(
       `
       SELECT
@@ -35,7 +32,6 @@ router.get("/:stallId", async (req, res) => {
         c.code,
         c.name,
         cli.price,
-        c.image,
         IFNULL(i.stock, 0) AS stock,
         COALESCE(
           NULLIF(c.category, ''),
@@ -52,14 +48,29 @@ router.get("/:stallId", async (req, res) => {
         ON i.stall_id = ?
        AND i.candy_id = cli.candy_id
       WHERE cli.list_id = ?
-      ORDER BY cli.price, c.name
+      ORDER BY cli.price, c.code
       `,
       [stallId, candyListId]
     );
 
-    const uniquePrices = [...new Set(candies.map(c => Number(c.price)))].sort((a, b) => a - b);
+    /* 2b️⃣ FETCH IMAGES SEPARATELY (no JOIN/ORDER BY = no tmp table) */
+    const candyIds = candies.map(c => c.id);
+    let imageMap = {};
+    if (candyIds.length > 0) {
+      const [imgRows] = await db.query(
+        "SELECT id, image FROM candies WHERE id IN (?)",
+        [candyIds]
+      );
+      imgRows.forEach(r => { imageMap[r.id] = r.image; });
+    }
+    const candiesWithImages = candies.map(c => ({
+      ...c,
+      image: imageMap[c.id] || null,
+    }));
 
-    /* 3️⃣ LOAD OFFERS (offer-list based) */
+    const uniquePrices = [...new Set(candiesWithImages.map(c => Number(c.price)))].sort((a, b) => a - b);
+
+    /* 3️⃣ LOAD OFFERS */
     let offers = [];
     if (offerListId) {
       const [rows] = await db.query(
@@ -72,14 +83,10 @@ router.get("/:stallId", async (req, res) => {
         `,
         [offerListId]
       );
-
       offers = rows.map(r => {
         if (r.price_pattern) {
-          try {
-            r.price_pattern = JSON.parse(r.price_pattern);
-          } catch {
-            r.price_pattern = [];
-          }
+          try { r.price_pattern = JSON.parse(r.price_pattern); }
+          catch { r.price_pattern = []; }
         }
         return r;
       });
@@ -95,7 +102,7 @@ router.get("/:stallId", async (req, res) => {
             Math.abs(current - basePrice) < Math.abs(closest - basePrice) ? current : closest
           , uniquePrices[0]);
         }
-        offer.candies = candies.filter(c => Number(c.price) === targetPrice);
+        offer.candies = candiesWithImages.filter(c => Number(c.price) === targetPrice);
       } else if (offer.price_pattern?.length) {
         const mappedPrices = offer.price_pattern.map(p => {
           const basePrice = Number(p.price);
@@ -107,13 +114,13 @@ router.get("/:stallId", async (req, res) => {
           }
           return match;
         });
-        offer.candies = candies.filter(c => mappedPrices.includes(Number(c.price)));
+        offer.candies = candiesWithImages.filter(c => mappedPrices.includes(Number(c.price)));
       } else {
         offer.candies = [];
       }
     }
 
-    res.json({ stall, candies, offers });
+    res.json({ stall, candies: candiesWithImages, offers });
   } catch (err) {
     console.error("SALESMAN CONFIG ERROR:", err);
     res.status(500).json({ error: "Failed to load salesman config" });
